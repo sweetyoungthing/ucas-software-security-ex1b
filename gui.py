@@ -184,7 +184,14 @@ class App:
         client = None
         try:
             while True:
-                work = self.work.get()
+                try:
+                    work = self.work.get(timeout=1)
+                except queue.Empty:
+                    if client is not None and not client.connected:
+                        client.close()
+                        client = None
+                        self.events.put(("disconnected", index))
+                    continue
                 if self.stopping.is_set() or work is None:
                     return
                 action, job, name, path = work
@@ -212,6 +219,8 @@ class App:
                     self.events.put(("done", job, action, name, receipt))
                 except Exception as exc:
                     if client is not None and not client.connected:
+                        client.close()
+                        client = None
                         self.events.put(("disconnected", index))
                     self.events.put(("error", action, job, name, str(exc)))
         finally:
