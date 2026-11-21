@@ -19,7 +19,7 @@ import time
 from client import Client, RemoteError, TransferInterrupted
 import protocol as p
 from server import DISK_QUOTA, HANDSHAKE_TIMEOUT, MAX_CONNECTIONS, MAX_USER_SESSIONS
-from setup_lab import issue, make_ca
+from setup_lab import ACCOUNTS, issue, make_ca
 
 
 SOURCE = Path(__file__).resolve().parent
@@ -85,7 +85,7 @@ def interrupt_after_first(done, total):
         raise TransferInterrupted("controlled disconnect after first chunk")
 
 
-def exercise(root, state, port, record):
+def exercise(root, state, port, record, transfer_only=False):
     sample = root / "sample.bin"
     sample.write_bytes(hashlib.shake_256(b"EX1B verified fixture").digest(2 * p.CHUNK + 313))
     contents = sample.read_bytes()
@@ -161,6 +161,9 @@ def exercise(root, state, port, record):
     record("两用户、三会话并发", f"三任务同时进入上传状态，各传 {fixture.stat().st_size:,} B 并通过字节校验")
     check(results[2][2] >= fixture.stat().st_size / (2 * 2**20) - 0.02, "Bob transfer rate")
     record("按用户限速", f"Bob {fixture.stat().st_size:,} B 耗时 {results[2][2]:.3f} 秒，符合 2 MiB/s 配置")
+
+    if transfer_only:
+        return
 
     with connect("bob") as bob:
         check({item["name"] for item in bob.list_files()} == {"c.bin"}, "Bob can see Alice files")
@@ -250,9 +253,82 @@ def exercise(root, state, port, record):
            f"第 {MAX_CONNECTIONS + 1} 条连接被立即拒绝；{HANDSHAKE_TIMEOUT} 秒握手超时后可重新认证")
 
 
+def exercise_duplex(root, state, port, record):
+    size = 4 * 2**20
+    payload = hashlib.shake_256(b"EX1B bidirectional fixture").digest(size)
+    digest = hashlib.sha256(payload).hexdigest()
+    source = root / "duplex.bin"
+    source.write_bytes(payload)
+    users = ("alice", "bob")
+    jobs = [(user, direction) for user in users for direction in ("put", "get")]
+    started_at = []
+    ready = threading.Barrier(len(jobs), action=lambda: started_at.append(time.monotonic()))
+
+    def seed(user):
+        with Client(state, user, port=port) as client:
+            client.upload(source, "duplex-source.bin")
+
+    def transfer(user, direction):
+        first_chunk_at = None
+        last_chunk_at = None
+
+        def on_progress(done, total):
+            nonlocal first_chunk_at, last_chunk_at
+            if done == 0:
+                ready.wait(timeout=8)
+            else:
+                when = time.monotonic()
+                if first_chunk_at is None:
+                    first_chunk_at = when
+                if done == total:
+                    last_chunk_at = when
+
+        with Client(state, user, port=port) as client:
+            check(client.info["rate"] == ACCOUNTS[user], f"{user}: wrong account rate")
+            if direction == "put":
+                result = client.upload(source, "duplex-upload.bin", on_progress)
+                target = state / "storage" / user / "duplex-upload.bin"
+            else:
+                target = root / f"{user}-duplex-download.bin"
+                result = client.download("duplex-source.bin", target, on_progress)
+            check(result == {"size": size, "sha256": digest, "offset": 0}, "duplex transfer receipt")
+            check(target.read_bytes() == payload, "duplex transfer content")
+            check(first_chunk_at is not None and last_chunk_at is not None, "missing duplex progress")
+            return client.local_address[1], first_chunk_at, last_chunk_at
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        list(pool.map(seed, users))
+        tasks = {job: pool.submit(transfer, *job) for job in jobs}
+        results = {job: task.result(timeout=30) for job, task in tasks.items()}
+
+    check(len({port for port, _, _ in results.values()}) == len(jobs), "distinct duplex sessions")
+    overlap = min(last for _, _, last in results.values()) - max(
+        first for _, first, _ in results.values()
+    )
+    check(overlap > 0, "the four transfers did not overlap in payload time")
+    record("两上传与两下载同时进行",
+           f"四条 TLS 会话的有效数据传输重叠 {overlap:.3f} 秒；每个文件 {size:,} B，四份均逐字节一致")
+
+    elapsed = {}
+    rate_notes = []
+    for user in users:
+        elapsed[user] = max(results[user, direction][2] for direction in ("put", "get")) - started_at[0]
+        configured = ACCOUNTS[user] / 2**20
+        ideal_minimum = 2 * size / ACCOUNTS[user]
+        check(elapsed[user] >= ideal_minimum - 0.05, f"{user}: aggregate rate exceeded")
+        rate_notes.append(
+            f"{user} 双向共 {2 * size // 2**20} MiB 用时 {elapsed[user]:.3f} 秒，"
+            f"平均 {2 * size / 2**20 / elapsed[user]:.2f} MiB/s，配置 {configured:g} MiB/s"
+        )
+    check(elapsed["alice"] < elapsed["bob"], "different account caps were not observed")
+    record("按身份限制双向聚合带宽", "；".join(rate_notes))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", type=Path, help="write observed test evidence as JSON")
+    parser.add_argument("--transfer-only", action="store_true",
+                        help="run normal file-transfer, authentication, concurrency and bandwidth checks")
     args = parser.parse_args()
     environment = f"{platform.platform()} · Python {platform.python_version()} · {ssl.OPENSSL_VERSION}"
     results = []
@@ -270,13 +346,17 @@ def main():
         print("$ python3 setup_lab.py --state ./lab-state", flush=True)
         subprocess.run([sys.executable, "setup_lab.py", "--state", str(state)], cwd=SOURCE, check=True)
         with deployment(state) as port:
-            exercise(root, state, port, record)
+            exercise(root, state, port, record, args.transfer_only)
+            exercise_duplex(root, state, port, record)
     print(f"PASS  {len(results)}/{len(results)} 项端到端检查", flush=True)
     if args.evidence:
         args.evidence.write_text(json.dumps({
             "environment": environment,
             "build": "python3 -m compileall -q . 退出码为 0",
-            "verify_command": "python3 verify.py --evidence ../evidence.json",
+            "verify_command": (
+                "python3 verify.py --transfer-only --evidence ../evidence.json" if args.transfer_only
+                else "python3 verify.py --evidence ../evidence.json"
+            ),
             "results": results,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

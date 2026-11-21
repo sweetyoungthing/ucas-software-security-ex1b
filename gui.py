@@ -11,7 +11,7 @@ import unicodedata
 from client import Client, TransferInterrupted, connection_args
 from protocol import valid_name
 
-WORKERS = 3
+WORKERS = 4
 
 
 def display_size(size):
